@@ -16,11 +16,46 @@ src/pqscan/
   scanner.py    两阶段列读取、精确行选择、读取请求在执行入口即时登记
   reference.py  独立核对：无剪枝全扫描 + 纯 Python 3VL（与引擎不同代码路径）
   runner.py     串联计划/扫描/核对，落盘 plans、results、run_record、verification
+  versions.py   版本台账：快照血缘与逐格映射，坐标换算
+  snapshot.py   快照 Parquet 读写（每行组一个 row group，可再扫描）
+  rearrange.py  离线重排：逐行搬迁清单校验与落盘，产出新版本
+  locate.py     定位：祖先版坐标 -> 指定后继版现行坐标 / 退役 / 不同链
+  patch.py      订正单回放：按行裁决旧值/目标值/冲突，写出新版本
   cli.py        命令行入口
-tests/          pytest 套件（12 个用例）
+tests/          pytest 套件（12 个原用例 + 15 个重排/定位/订正用例）
 docs/plan_format.md  计划与运行记录的 JSON 格式契约
+docs/versions_rearrange_patch.md  版本台账、重排、定位、订正回放契约
+examples/       命令行与带断言的可复跑样例
 output/         运行产物（git 忽略）
 ```
+
+## 版本、重排与订正回放（新增）
+
+在原有 `run`/`verify` 之外新增离线能力，围绕一个版本台账目录（`versions.json`
++ 各版 `{version}.parquet`）。快照只追加不覆盖，老版可继续按原坐标读取，
+新快照也是真正可再扫描的 Parquet：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pqscan.cli init \
+    --dir vdir --source fixtures/stats.parquet --version v0
+PYTHONPATH=src .venv/bin/python -m pqscan.cli rearrange --dir vdir --plan rearrange.json
+PYTHONPATH=src .venv/bin/python -m pqscan.cli locate \
+    --dir vdir --from v0 --to v2 --row-group 0 --row 0
+PYTHONPATH=src .venv/bin/python -m pqscan.cli patch \
+    --dir vdir --patch patch.json --target v2 --new-version p1
+```
+
+- **重排**：每个旧行恰好消费一次，可搬入指定新位置或退役，可点名改字段；
+  遗漏、重复消费旧行、重复占用新位置、容量不符都整次拒绝，不产生可见版本。
+- **定位**：将任一祖先版坐标解析到指定后继版的现行坐标或退役状态，
+  区分版本是否在同一祖先链；支持向上与向下两个方向。
+- **订正回放**：订正单写明起始版与当时坐标，按行裁决每个字段
+  （`现值==旧值` 可改、`现值==目标值` 已达成、否则冲突，NULL 参与相等判断）。
+  行内任一冲突则整行不写，其他行仍可成功；成功项写入可扫描的新版本，老版不受影响。
+  订正版仍可定位祖先行。
+
+格式契约见 `docs/versions_rearrange_patch.md`，命令行可复跑样例见
+`examples/demo_cli.sh`，带断言的 Python 样例见 `examples/demo_rearrange_patch.py`。
 
 ## 运行
 
@@ -91,3 +126,8 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/ -q
 null_count 推理、NOT 的 UNKNOWN 处理与可证明 FALSE、OR 跨列不关联极值、
 无统计全保留、3VL 真值表、无命中不读投影列、过滤列复用、端到端与无剪枝
 全扫描一致、有/无统计结果相同而计划保守度不同、空结果 schema 与输出顺序。
+
+`tests/test_rearrange_patch.py`（15 用例）覆盖：重排的遗漏/重复消费/重复占用/
+容量不符整次拒绝、连续两次重排后旧版可读且新快照可再扫描、定位的现行/退役/
+不同链/向下回溯、订正的成功/退役/整行冲突/已达/NULL 相等/跨链不可达与
+单行冲突不影响其他行。
